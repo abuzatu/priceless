@@ -76,6 +76,12 @@ RUN poetry --version
 # now poetry install
 RUN poetry install
 
+# Playwright Chromium (system deps as root, browser binaries as jumbo)
+USER root
+RUN poetry run playwright install-deps chromium
+USER jumbo
+RUN poetry run playwright install chromium
+
 # use Dockerignore
 COPY --chown=jumbo:jumbo . $WORKDIR
 

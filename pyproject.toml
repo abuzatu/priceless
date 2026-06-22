@@ -40,6 +40,7 @@ quantstats = "^0.0.64"
 quantstats-lumi = "^0.3.3"
 yfinance = "^0.2.55"
 feedparser = "^6.0.12"
+playwright = "^1.49.0"
 
 
 [build-system]
