@@ -10,6 +10,7 @@ from proton_email.login import (
     extract_voucher_order_fields,
     extract_voucher_url_and_code,
     parse_message_datetime,
+    proton_session_path_for_email,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "extract_all_voucher_url_and_code_pairs",
     "extract_voucher_order_fields",
     "parse_message_datetime",
+    "proton_session_path_for_email",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -193,6 +194,19 @@ def parse_message_datetime(raw: str) -> Optional[datetime]:
     return None
 
 
+def proton_session_path_for_email(
+    email_address: str,
+    workdir: Optional[Path] = None,
+) -> Path:
+    """Return per-account Playwright storage state path for one Proton address."""
+    root = workdir or Path(os.getenv("WORKDIR", Path.cwd()))
+    sessions_dir = root / "data" / "proton_email" / "sessions"
+    safe = email_address.strip().lower()
+    safe = safe.replace("@", "_at_").replace("+", "_plus_")
+    safe = re.sub(r"[^\w.\-]+", "_", safe)
+    return sessions_dir / ("%s.json" % safe)
+
+
 class ProtonEmailLogin:
     """Browser-based Proton Mail client (no IMAP/API; E2E encryption)."""
 
@@ -218,6 +232,9 @@ class ProtonEmailLogin:
         screenshot_dir: Optional[str] = None,
         debug_version: str = "v01",
         slow_mo: int = 0,
+        storage_state_path: Optional[str] = None,
+        login_timeout_ms: int = 120_000,
+        human_verification_timeout_ms: int = 600_000,
     ) -> None:
         """Load credentials from `.env` and prepare browser settings.
 
@@ -230,6 +247,11 @@ class ProtonEmailLogin:
                 data/debug/proton_email).
             debug_version: Prefix for screenshot files, e.g. v01 -> v01_01_login_page.png.
             slow_mo: Milliseconds to pause between Playwright actions.
+            storage_state_path: Playwright cookies/localStorage JSON used to skip login.
+                Defaults to data/proton_email/sessions/<email>.json for the current
+                PROTON_EMAIL_ADDRESS_01 value.
+            login_timeout_ms: Max wait for login to finish under normal conditions.
+            human_verification_timeout_ms: Extra wait when Proton shows a CAPTCHA puzzle.
         """
         load_dotenv()
 
@@ -240,7 +262,14 @@ class ProtonEmailLogin:
         self.debug = debug
         self.debug_version = debug_version
         self.slow_mo = 300 if debug and slow_mo == 0 else slow_mo
+        self.login_timeout_ms = login_timeout_ms
+        self.human_verification_timeout_ms = human_verification_timeout_ms
         workdir = Path(os.getenv("WORKDIR", Path.cwd()))
+        self.storage_state_path = (
+            Path(storage_state_path)
+            if storage_state_path
+            else proton_session_path_for_email(self.email_address, workdir)
+        )
         self.screenshot_dir = (
             Path(screenshot_dir)
             if screenshot_dir
@@ -373,22 +402,31 @@ class ProtonEmailLogin:
                 "--disable-dev-shm-usage",
             ],
         )
-        self._context = await self._browser.new_context(
-            user_agent=(
+        context_kwargs = {
+            "user_agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1440, "height": 900},
-        )
+            "viewport": {"width": 1440, "height": 900},
+        }
+        if self.storage_state_path.exists():
+            context_kwargs["storage_state"] = str(self.storage_state_path)
+            self._log("Loading saved Proton session from %s" % self.storage_state_path)
+        self._context = await self._browser.new_context(**context_kwargs)
         self._page = await self._context.new_page()
         await self._page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
-        self._log("Signing in to Proton...")
-        await self._authenticate(self._page)
-        await self._screenshot(self._page, "authenticated")
-        self._log("Authenticated at %s" % self._page.url)
+        if await self._try_restore_session(self._page):
+            self._log("Reused saved Proton session.")
+            await self._screenshot(self._page, "authenticated")
+        else:
+            self._log("Signing in to Proton...")
+            await self._authenticate(self._page)
+            await self._save_storage_state()
+            await self._screenshot(self._page, "authenticated")
+            self._log("Authenticated at %s" % self._page.url)
 
         self._log("Opening inbox...")
         await self._open_inbox(self._page)
@@ -449,25 +487,79 @@ class ProtonEmailLogin:
         self._log("Submitting password...")
         await page.locator('button[type="submit"]').click()
 
-        try:
-            await page.wait_for_url(self.LOGGED_IN_URL, timeout=120_000)
-        except Exception as exc:
-            await self._screenshot(page, "login_timeout")
+        await self._wait_for_login_complete(page)
+
+    async def _wait_for_login_complete(self, page: Page) -> None:
+        deadline = time.monotonic() + self.login_timeout_ms / 1000
+        human_verification_logged = False
+        while time.monotonic() < deadline:
+            if self.LOGGED_IN_URL.search(page.url):
+                return
+            if await self._human_verification_visible(page):
+                if not human_verification_logged:
+                    await self._screenshot(page, "human_verification")
+                    if self.headless:
+                        self._log(
+                            "Human verification puzzle detected. The Docker notebook "
+                            "cannot show this window. Run ./bin/dev/proton-seed-session.sh "
+                            "on your Mac, then re-run with default headless=True."
+                        )
+                    else:
+                        self._log(
+                            "Human verification puzzle detected. Complete the puzzle "
+                            "in the browser window, then click Next."
+                        )
+                    human_verification_logged = True
+                    deadline = max(
+                        deadline,
+                        time.monotonic() + self.human_verification_timeout_ms / 1000,
+                    )
+                await page.wait_for_timeout(2000)
+                continue
             if await self._two_factor_prompt_visible(page):
                 raise RuntimeError(
                     "Proton Mail requested 2FA. Disable 2FA for this account or "
                     "complete a manual browser login once and reuse storage state."
-                ) from exc
+                )
             if await self._login_error_visible(page):
                 raise RuntimeError(
                     "Proton Mail login failed. Check PROTON_EMAIL_ADDRESS_01 and "
                     "PROTON_EMAIL_PASSWORD_01 in .env."
-                ) from exc
-            raise RuntimeError(
-                "Proton Mail login timed out at %s. "
-                "Approve the sign-in alert on your phone if prompted."
-                % page.url
-            ) from exc
+                )
+            await page.wait_for_timeout(1000)
+
+        await self._screenshot(page, "login_timeout")
+        raise RuntimeError(
+            "Proton Mail login timed out at %s. "
+            "Human Verification (CAPTCHA) cannot be solved from the Docker notebook. "
+            "Run once on your Mac: ./bin/dev/proton-seed-session.sh "
+            "(see README_Proton.md), then re-run this notebook with default headless=True."
+            % page.url
+        )
+
+    async def _try_restore_session(self, page: Page) -> bool:
+        if not self.storage_state_path.exists():
+            return False
+        try:
+            await page.goto(self.INBOX_URL, wait_until="domcontentloaded", timeout=60_000)
+            if "login" in page.url:
+                return False
+            await page.wait_for_selector(
+                '[data-testid="message-list-loaded"], .item-container, '
+                '[data-testid="conversation-header"]',
+                timeout=30_000,
+            )
+            self._log("Inbox URL: %s" % page.url)
+            return True
+        except Exception:
+            return False
+
+    async def _save_storage_state(self) -> None:
+        if self._context is None:
+            return
+        self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(self.storage_state_path))
+        self._log("Saved Proton session to %s" % self.storage_state_path)
 
     async def _open_inbox(self, page: Page) -> None:
         if "account.proton.me/apps" in page.url:
@@ -551,6 +643,12 @@ class ProtonEmailLogin:
     async def _two_factor_prompt_visible(self, page: Page) -> bool:
         two_factor = page.get_by_text(re.compile(r"two.?factor|authentication code", re.I))
         return await two_factor.count() > 0
+
+    async def _human_verification_visible(self, page: Page) -> bool:
+        captcha = page.get_by_text(
+            re.compile(r"human verification|verify you are human", re.I)
+        )
+        return await captcha.count() > 0
 
     async def _login_error_visible(self, page: Page) -> bool:
         error = page.locator('[role="alert"], .notification--danger, .alert-block--danger')

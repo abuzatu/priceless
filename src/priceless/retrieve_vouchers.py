@@ -113,12 +113,63 @@ def order_timestamp_from_voucher(voucher: LibraVoucherDetail) -> str:
 
 
 def voucher_excel_filename(voucher: LibraVoucherDetail, prefix: str) -> str:
-    """Build `{prefix}_{received_at}_{comanda_nr}.xlsx`."""
+    """Build `{prefix}_{received_at}_{comanda_id}_{redemption_id}.xlsx`.
+
+    One order (comanda) can have several redemptions; including both avoids
+    overwriting Excel files when multiple line items share the same order number.
+    """
     timestamp = order_timestamp_from_voucher(voucher)
-    comanda_nr = (voucher.comanda_nr or "unknown").strip()
+    order_key = (
+        (voucher.comanda_id or "").strip()
+        or (voucher.comanda_nr or "").strip()
+        or "unknown"
+    )
+    redemption_id = (voucher.redemption_id or "").strip()
     safe_prefix = re.sub(r"[^\w\-]+", "_", prefix).strip("_") or "vouchers"
-    safe_comanda = comanda_nr.replace("/", "-")
-    return "%s_%s_%s.xlsx" % (safe_prefix, timestamp, safe_comanda)
+    safe_order_key = order_key.replace("/", "-")
+    if redemption_id:
+        return "%s_%s_%s_%s.xlsx" % (
+            safe_prefix,
+            timestamp,
+            safe_order_key,
+            redemption_id,
+        )
+    return "%s_%s_%s.xlsx" % (safe_prefix, timestamp, safe_order_key)
+
+
+def combined_voucher_excel_filename(
+    prefix: str,
+    results: list[RetrievedVouchersResult],
+    *,
+    run_at: Optional[datetime] = None,
+) -> str:
+    """Build `{prefix}_combined_{run_at}_{from}_to_{to}.xlsx`."""
+    safe_prefix = re.sub(r"[^\w\-]+", "_", prefix).strip("_") or "vouchers"
+    run_timestamp = (run_at or datetime.now()).strftime("%Y-%m-%d-%H-%M-%S")
+    timestamps = sorted(order_timestamp_from_voucher(result.source) for result in results)
+    if not timestamps:
+        return "%s_combined_%s.xlsx" % (safe_prefix, run_timestamp)
+    if timestamps[0] == timestamps[-1]:
+        return "%s_combined_%s_%s.xlsx" % (safe_prefix, run_timestamp, timestamps[0])
+    return "%s_combined_%s_%s_to_%s.xlsx" % (
+        safe_prefix,
+        run_timestamp,
+        timestamps[0],
+        timestamps[-1],
+    )
+
+
+def combined_voucher_excel_path(
+    prefix: str,
+    results: list[RetrievedVouchersResult],
+    output_dir: Union[str, Path],
+    *,
+    run_at: Optional[datetime] = None,
+) -> Path:
+    """Return full path for a combined export of several retrieval results."""
+    return Path(output_dir) / combined_voucher_excel_filename(
+        prefix, results, run_at=run_at
+    )
 
 
 def voucher_excel_path(
@@ -155,6 +206,34 @@ def export_vouchers_to_excel(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = vouchers_result_to_rows(result)
+    dataframe = pd.DataFrame(rows, columns=list(VOUCHER_EXCEL_COLUMNS))
+    dataframe.to_excel(path, index=False)
+    return path
+
+
+def export_combined_vouchers_to_excel(
+    results: list[RetrievedVouchersResult],
+    output_path: Optional[Union[str, Path]] = None,
+    *,
+    prefix: str = "vouchers",
+    output_dir: Optional[Union[str, Path]] = None,
+    run_at: Optional[datetime] = None,
+) -> Path:
+    """Write gift cards from several retrievals into one Excel file."""
+    if not results:
+        raise ValueError("No voucher results to export.")
+
+    run_at = run_at or datetime.now()
+    base_dir = Path(output_dir) if output_dir is not None else default_voucher_output_dir()
+    if output_path is None:
+        path = combined_voucher_excel_path(prefix, results, base_dir, run_at=run_at)
+    else:
+        path = Path(output_path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Union[str, float, int]]] = []
+    for result in results:
+        rows.extend(vouchers_result_to_rows(result))
     dataframe = pd.DataFrame(rows, columns=list(VOUCHER_EXCEL_COLUMNS))
     dataframe.to_excel(path, index=False)
     return path
@@ -217,7 +296,8 @@ class RetrieveVouchers:
 
         Args:
             voucher: Email detail with `url` (Reward Cloud link) and `code`.
-            prefix: Excel filename prefix, e.g. `adi` -> adi_2026-06-21-04-49-00_979182.xlsx.
+            prefix: Excel filename prefix, e.g.
+                `adi` -> adi_2026-06-21-04-49-00_979182-1_1008541841.xlsx.
             output_dir: Folder for Excel output (default: data/priceless_folder).
             debug: Save step screenshots under `data/debug/priceless_retrieve_vouchers`.
             debug_version: Prefix for screenshots, e.g. v01 -> v01_01_code_page.png.

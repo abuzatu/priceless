@@ -22,6 +22,9 @@ stop:
 notebook:
 	./bin/dev/notebook-start.sh
 
+proton-seed-session:
+	./bin/dev/proton-seed-session.sh
+
 ipython:
 	./bin/dev/ipython-start.sh
 
