@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,23 @@ class LibraOneTimeCode:
     received_at: str
 
 
+@dataclass(frozen=True)
+class LibraVoucherDetail:
+    """Claim URL, code, and order summary from a Libra e-voucher email."""
+
+    url: str
+    code: str
+    received_at: str
+    comanda_nr: str = ""
+    redemption_id: str = ""
+    comanda_id: str = ""
+    cantitate: str = ""
+    puncte: str = ""
+    subtotal: str = ""
+    total: str = ""
+    received_at_dt: Optional[datetime] = None
+
+
 def extract_one_time_code(body: str) -> str:
     """Parse a numeric one-time code from Libra email body text."""
     patterns = (
@@ -62,6 +80,119 @@ def extract_one_time_code(body: str) -> str:
     )
 
 
+def _normalize_voucher_text(text: str) -> str:
+    """Collapse whitespace and strip invisible chars from email body text."""
+    cleaned = text.replace("\u200b", "").replace("\ufeff", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def extract_voucher_order_fields(text: str, html: str = "") -> dict[str, str]:
+    """Parse order summary fields from a Libra e-voucher email body."""
+    combined = _normalize_voucher_text(
+        text + " " + re.sub(r"\s+", " ", html or "")
+    )
+
+    def grab(pattern: str) -> str:
+        match = re.search(pattern, combined, re.I)
+        return match.group(1).strip() if match else ""
+
+    return {
+        "comanda_nr": grab(r"Comanda #:\s*(\d+)"),
+        "redemption_id": grab(r"Redemption ID:\s*(\d+)"),
+        "comanda_id": grab(r"Comanda ID\s*(\d+-\d+)"),
+        "cantitate": grab(r"Cantitate\s*(\d+)"),
+        "puncte": grab(r"Puncte\s*([\d.,]+)"),
+        "subtotal": grab(r"Subtotal\s*([\d.,]+)"),
+        "total": grab(r"Total\s*:\s*([\d.,]+)"),
+    }
+
+
+def extract_all_voucher_url_and_code_pairs(text: str, html: str = "") -> list[tuple[str, str]]:
+    """Parse all (url, code) pairs from a Libra e-voucher email body."""
+    combined_html = html or ""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    combined = normalized + " " + re.sub(r"\s+", " ", combined_html)
+
+    urls: list[str] = []
+    for match in re.finditer(
+        r'href=["\'](https?://[^"\']+)["\'][^>]*>([^<]*)<',
+        combined_html,
+        re.I,
+    ):
+        link_text = match.group(2)
+        if re.search(r"vizualiza|click aici", link_text, re.I):
+            urls.append(match.group(1))
+
+    if not urls:
+        for candidate in re.findall(r"https?://[^\s<>\"']+", combined):
+            lowered = candidate.lower()
+            if any(
+                token in lowered
+                for token in (
+                    "rewardcloud",
+                    "voucher",
+                    "priceless",
+                    "evoucher",
+                    "e-voucher",
+                    "gift",
+                    "emag",
+                )
+            ):
+                urls.append(candidate.rstrip(".,;)"))
+
+    # "." matches Romanian "ț" in contestație (t-comma) and plain ASCII variants.
+    codes = re.findall(
+        r"Cod de contesta.{1,3}:\s*([a-f0-9\-]{36})",
+        combined,
+        re.I,
+    )
+    if not codes:
+        codes = re.findall(
+            r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+            combined,
+            re.I,
+        )
+
+    pairs: list[tuple[str, str]] = []
+    if urls and codes:
+        for index, code in enumerate(codes):
+            url = urls[index] if index < len(urls) else urls[-1]
+            pairs.append((url, code))
+    return pairs
+
+
+def extract_voucher_url_and_code(text: str, html: str = "") -> tuple[str, str]:
+    """Parse the first claim URL and code from a Libra e-voucher email."""
+    pairs = extract_all_voucher_url_and_code_pairs(text, html)
+    if not pairs:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        raise ValueError(
+            "Could not find voucher url/code. Body preview: %s"
+            % (normalized[:300] or "<empty>")
+        )
+    return pairs[0]
+
+
+def parse_message_datetime(raw: str) -> Optional[datetime]:
+    """Parse a Proton message time (ISO `datetime` attr or human-readable label)."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%A, %d %B %Y at %I:%M %p",
+        "%d %B %Y at %I:%M %p",
+    ):
+        try:
+            return datetime.strptime(raw.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
 class ProtonEmailLogin:
     """Browser-based Proton Mail client (no IMAP/API; E2E encryption)."""
 
@@ -73,6 +204,8 @@ class ProtonEmailLogin:
     LIBRA_ONE_TIME_CODE_SUBJECT = re.compile(
         r"One-time code for Libra X Priceless", re.I
     )
+    # "." matches any character so we do not depend on typing Romanian "ă".
+    LIBRA_VOUCHER_SUBJECT = re.compile(r"Detalii comand. e-voucher", re.I)
 
     def __init__(
         self,
@@ -152,6 +285,42 @@ class ProtonEmailLogin:
             await self._handle_error(exc)
             raise
 
+    async def get_libra_voucher_details(
+        self,
+        since: Optional[datetime] = None,
+    ) -> list[LibraVoucherDetail]:
+        """Return voucher details for each e-voucher message in the latest matching thread.
+
+        Args:
+            since: If set, only include messages received strictly after this time.
+        """
+        try:
+            await self._connect_to_inbox()
+            self._log('Looking for "Detalii comand* e-voucher" thread...')
+            details = await self._read_libra_voucher_thread(self._page, since=since)
+            await self._screenshot(self._page, "libra_voucher_details")
+            self._log("Found %s voucher message(s)." % len(details))
+            for index, detail in enumerate(details, start=1):
+                self._log(
+                    "  %s. comanda#=%s redemption_id=%s comanda_id=%s "
+                    "cantitate=%s puncte=%s subtotal=%s total=%s code=%s"
+                    % (
+                        index,
+                        detail.comanda_nr,
+                        detail.redemption_id,
+                        detail.comanda_id,
+                        detail.cantitate,
+                        detail.puncte,
+                        detail.subtotal,
+                        detail.total,
+                        detail.code,
+                    )
+                )
+            return details
+        except Exception as exc:
+            await self._handle_error(exc)
+            raise
+
     def login_sync(self) -> ProtonEmailMessage:
         """Blocking login for scripts outside an asyncio event loop (e.g. CLI)."""
         try:
@@ -171,6 +340,19 @@ class ProtonEmailLogin:
             return asyncio.run(self.get_libra_one_time_code())
         raise RuntimeError(
             "Use `await client.get_libra_one_time_code()` in Jupyter/async contexts."
+        )
+
+    def get_libra_voucher_details_sync(
+        self,
+        since: Optional[datetime] = None,
+    ) -> list[LibraVoucherDetail]:
+        """Blocking version of `get_libra_voucher_details`."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.get_libra_voucher_details(since=since))
+        raise RuntimeError(
+            "Use `await client.get_libra_voucher_details()` in Jupyter/async contexts."
         )
 
     async def _connect_to_inbox(self) -> None:
@@ -475,35 +657,459 @@ class ProtonEmailLogin:
 
     async def _read_message_body(self, page: Page) -> str:
         """Read the full visible body of the currently open message."""
+        text, _html = await self._read_message_body_parts(page)
+        return text
+
+    async def _conversation_iframes(self, page: Page) -> Locator:
+        """Return iframe locators for email bodies in the open conversation."""
+        for selector in (
+            '[data-testid="conversation-view"] iframe',
+            '[data-shortcut-target="conversation-body"] iframe',
+        ):
+            iframes = page.locator(selector)
+            if await iframes.count() > 0:
+                return iframes
+        iframes = page.locator("iframe")
+        if await iframes.count() > 0:
+            return iframes
+        raise RuntimeError("No message iframes found in conversation.")
+
+    async def _iframe_for_message(
+        self, page: Page, headers: Locator, index: int
+    ) -> Locator:
+        """Click a thread message header and return its email iframe."""
+        header = headers.nth(index)
+        await header.scroll_into_view_if_needed(timeout=10_000)
+        await header.click(timeout=10_000)
+        await page.wait_for_timeout(1000)
+
+        relative_selectors = (
+            'xpath=ancestor::*[@data-shortcut-target="message-view"][1]//iframe',
+            'xpath=ancestor::*[contains(@class, "message-container")][1]//iframe',
+            "xpath=ancestor::article[1]//iframe",
+            'xpath=ancestor::*[@data-testid="message-view:body"][1]//iframe',
+            "xpath=following::iframe[1]",
+        )
+        for selector in relative_selectors:
+            iframe = header.locator(selector).first
+            if await iframe.count() > 0:
+                await iframe.scroll_into_view_if_needed(timeout=10_000)
+                await self._align_iframe_in_conversation(page, iframe)
+                return iframe
+
+        iframes = await self._conversation_iframes(page)
+        count = await iframes.count()
+        if count == 0:
+            raise RuntimeError("No iframes in conversation for message %s." % (index + 1))
+        iframe = iframes.nth(min(index, count - 1))
+        await iframe.scroll_into_view_if_needed(timeout=10_000)
+        await self._align_iframe_in_conversation(page, iframe)
+        return iframe
+
+    async def _iframe_parts_from_message_view(
+        self, message_view: Locator
+    ) -> tuple[str, str]:
+        result = await message_view.evaluate(
+            """el => {
+              const iframe = el.querySelector('iframe');
+              if (!iframe || !iframe.contentDocument) {
+                return {text: '', html: ''};
+              }
+              const body = iframe.contentDocument.body;
+              return {
+                text: (body.textContent || '').trim(),
+                html: (body.innerHTML || '').trim()
+              };
+            }"""
+        )
+        return result.get("text", ""), result.get("html", "")
+
+    async def _align_iframe_in_conversation(
+        self, page: Page, iframe_loc: Locator
+    ) -> None:
+        conversation = page.locator('[data-testid="conversation-view"]').first
+        if await conversation.count() == 0:
+            return
+        iframe_box = await iframe_loc.bounding_box()
+        conv_box = await conversation.bounding_box()
+        if not iframe_box or not conv_box:
+            return
+        current_scroll = await conversation.evaluate("el => el.scrollTop")
+        delta = iframe_box["y"] - conv_box["y"]
+        await conversation.evaluate(
+            "(el, top) => { el.scrollTop = Math.max(0, top); }",
+            current_scroll + delta - 60,
+        )
+        await page.wait_for_timeout(200)
+
+    async def _wheel_scroll_locator(self, page: Page, target: Locator, steps: int) -> None:
+        box = await target.bounding_box()
+        if not box:
+            return
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + min(box["height"] / 2, box["height"] - 10)
+        await page.mouse.move(x, y)
+        for _ in range(steps):
+            await page.mouse.wheel(0, 700)
+            await page.wait_for_timeout(150)
+
+    async def _scroll_iframe_until_voucher(
+        self, page: Page, iframe_loc: Locator
+    ) -> tuple[str, str]:
+        """Scroll one email iframe until voucher fields are in the DOM."""
+        await iframe_loc.scroll_into_view_if_needed(timeout=10_000)
+        await self._align_iframe_in_conversation(page, iframe_loc)
+        await page.wait_for_timeout(300)
+
+        handle = await iframe_loc.element_handle()
+        if handle is None:
+            raise RuntimeError("Email iframe handle not available.")
+        frame = await handle.content_frame()
+        if frame is None:
+            raise RuntimeError("Email iframe content not loaded.")
+
+        best_text = ""
+        best_html = ""
+        body = frame.locator("body")
+
+        scroll_iframe_js = """() => {
+          const nodes = [document.documentElement, document.body,
+            ...document.body.querySelectorAll('*')];
+          for (const node of nodes) {
+            try {
+              if (node.scrollHeight > node.clientHeight + 5) {
+                node.scrollTop = Math.min(node.scrollTop + 450, node.scrollHeight);
+              }
+            } catch (e) {}
+          }
+        }"""
+
+        scroll_to_bottom_js = """() => {
+          const nodes = [document.documentElement, document.body,
+            ...document.body.querySelectorAll('*')];
+          for (const node of nodes) {
+            try {
+              if (node.scrollHeight > node.clientHeight + 5) {
+                node.scrollTop = node.scrollHeight;
+              }
+            } catch (e) {}
+          }
+        }"""
+
+        conversation = page.locator('[data-testid="conversation-view"]').first
+
+        for _ in range(60):
+            if await conversation.count() > 0:
+                await conversation.evaluate(
+                    """el => {
+                      el.scrollTop = Math.min(el.scrollTop + 400, el.scrollHeight);
+                    }"""
+                )
+            await body.evaluate(scroll_iframe_js)
+            await self._wheel_scroll_locator(page, iframe_loc, 2)
+            await page.wait_for_timeout(200)
+
+            frame_text = (await body.evaluate("el => (el.textContent || '').trim()")).strip()
+            frame_html = (await body.inner_html()).strip()
+            if len(frame_text) > len(best_text):
+                best_text = frame_text
+                best_html = frame_html
+            if re.search(r"Cod de contesta.{1,3}:", frame_text, re.I) and re.search(
+                r"rewardcloud|vizualiza|Redemption ID", frame_text + " " + frame_html, re.I
+            ):
+                return frame_text, frame_html
+
+        await self._wheel_scroll_locator(page, iframe_loc, 30)
+        for _ in range(5):
+            if await conversation.count() > 0:
+                await conversation.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+            await body.evaluate(scroll_to_bottom_js)
+            await page.wait_for_timeout(300)
+
+        frame_text = (await body.evaluate("el => (el.textContent || '').trim()")).strip()
+        frame_html = (await body.inner_html()).strip()
+        return frame_text or best_text, frame_html or best_html
+
+    async def _scroll_message_view_until_voucher(
+        self, page: Page, iframe_loc: Locator
+    ) -> tuple[str, str]:
+        """Backward-compatible alias for iframe scrolling."""
+        return await self._scroll_iframe_until_voucher(page, iframe_loc)
+
+    async def _scroll_frame_until_voucher(self, page: Page, frame) -> tuple[str, str]:
+        """Scroll an email iframe until voucher fields appear, then return text + HTML."""
+        body = frame.locator("body")
+        best_text = ""
+        best_html = ""
+        for _ in range(60):
+            frame_text = (await body.evaluate("el => (el.textContent || '').trim()")).strip()
+            frame_html = (await body.inner_html()).strip()
+            if len(frame_text) > len(best_text):
+                best_text = frame_text
+                best_html = frame_html
+            if re.search(r"Cod de contesta.{1,3}:", frame_text, re.I) and re.search(
+                r"rewardcloud|vizualiza|Redemption ID", frame_text + frame_html, re.I
+            ):
+                return frame_text, frame_html
+            await body.evaluate(
+                """el => {
+                    const nodes = [el, ...el.querySelectorAll('*')];
+                    for (const node of nodes) {
+                      try {
+                        if (node.scrollHeight > node.clientHeight + 5) {
+                          node.scrollTop = Math.min(
+                            node.scrollTop + 450,
+                            node.scrollHeight
+                          );
+                        }
+                      } catch (e) {}
+                    }
+                    document.documentElement.scrollTop += 450;
+                }"""
+            )
+            await page.wait_for_timeout(200)
+
+        return await self._scroll_frame_body(page, frame)
+
+    async def _scroll_frame_body(self, page: Page, frame) -> tuple[str, str]:
+        """Scroll an email iframe to the bottom and return full text + HTML."""
+        body = frame.locator("body")
+        for _ in range(10):
+            await body.evaluate(
+                """el => {
+                    el.scrollTop = el.scrollHeight;
+                    document.documentElement.scrollTop =
+                        document.documentElement.scrollHeight;
+                    el.querySelectorAll('*').forEach(node => {
+                        if (node.scrollHeight > node.clientHeight + 5) {
+                            node.scrollTop = node.scrollHeight;
+                        }
+                    });
+                }"""
+            )
+            await page.wait_for_timeout(300)
+        frame_text = (await body.evaluate("el => (el.textContent || '').trim()")).strip()
+        frame_html = (await body.inner_html()).strip()
+        return frame_text, frame_html
+
+    async def _read_body_parts_from_message_view(
+        self, page: Page, body_loc: Locator
+    ) -> tuple[str, str]:
+        """Read scrolled iframe content from one message-view body block."""
+        if await body_loc.count() == 0:
+            raise RuntimeError("Message body block not found.")
+
+        await body_loc.scroll_into_view_if_needed(timeout=10_000)
+        iframe = body_loc.locator("iframe").first
+        if await iframe.count() > 0:
+            handle = await iframe.element_handle()
+            if handle is not None:
+                frame = await handle.content_frame()
+                if frame is not None:
+                    return await self._scroll_frame_body(page, frame)
+
+        raise RuntimeError("No iframe found inside message body block.")
+
+    async def _email_iframe_frames(self, page: Page) -> list:
+        """Return email content frames from the open conversation."""
+        frames = []
+        iframes = page.locator(
+            '[data-testid="conversation-view"] [data-testid="message-view:body"] iframe, '
+            '[data-testid="message-view:body"] iframe, iframe'
+        )
+        count = await iframes.count()
+        for index in range(count):
+            try:
+                handle = await iframes.nth(index).element_handle()
+                if handle is None:
+                    continue
+                frame = await handle.content_frame()
+                if frame is not None:
+                    frames.append(frame)
+            except Exception:
+                continue
+
+        if frames:
+            return frames
+
+        for frame in page.frames:
+            if frame != page.main_frame:
+                frames.append(frame)
+        return frames
+
+    async def _read_active_iframe_parts(self, page: Page) -> tuple[str, str]:
+        """Read the currently visible email iframe after scrolling to the voucher."""
+        frames = await self._email_iframe_frames(page)
+        if not frames:
+            raise RuntimeError("No email iframe found.")
+
+        best_text = ""
+        best_html = ""
+        for frame in frames:
+            try:
+                frame_text, frame_html = await self._scroll_frame_until_voucher(page, frame)
+                if len(frame_text) > len(best_text):
+                    best_text = frame_text
+                    best_html = frame_html
+            except Exception:
+                continue
+
+        if best_text or best_html:
+            self._log("Email body preview: %s..." % (best_text[:120] or best_html[:120]))
+            return best_text, best_html
+
+        raise RuntimeError("Could not read email iframe content.")
+
+    def _redemption_id(self, text: str) -> str:
+        return extract_voucher_order_fields(text).get("redemption_id", "")
+
+    async def _expand_conversation_headers(self, page: Page, headers: Locator) -> None:
+        header_count = await headers.count()
+        for index in range(header_count):
+            try:
+                header = headers.nth(index)
+                await header.scroll_into_view_if_needed(timeout=10_000)
+                await header.click(timeout=10_000)
+                await page.wait_for_timeout(600)
+            except Exception:
+                continue
+
+    async def _read_libra_voucher_thread(
+        self,
+        page: Page,
+        since: Optional[datetime] = None,
+    ) -> list[LibraVoucherDetail]:
+        row = await self._find_message_by_subject(page, self.LIBRA_VOUCHER_SUBJECT)
+        subject = await self._row_subject(row)
+        await row.click()
+        await page.wait_for_selector(
+            '[data-testid="conversation-header"], [data-testid="message-header"], iframe',
+            timeout=60_000,
+        )
+        self._log("Opened voucher thread: %s" % subject)
+
+        headers = await self._conversation_headers(page)
+        header_count = await headers.count()
+        self._log("Reading %s message(s) one by one..." % header_count)
+
+        self._log("Expanding all messages in thread...")
+        await self._expand_conversation_headers(page, headers)
+        await page.wait_for_timeout(1200)
+        try:
+            iframe_count = await (await self._conversation_iframes(page)).count()
+            self._log("Found %s message iframe(s)." % iframe_count)
+        except RuntimeError:
+            iframe_count = 0
+            self._log("No message iframes visible yet.")
+
+        details: list[LibraVoucherDetail] = []
+        seen: set[tuple[str, str]] = set()
+        seen_redemption_ids: set[str] = set()
+
+        for index in range(header_count):
+            header = headers.nth(index)
+            try:
+                iframe_loc = await self._iframe_for_message(page, headers, index)
+                await page.wait_for_selector("iframe", timeout=30_000)
+            except Exception as exc:
+                self._log("Could not open message %s: %s" % (index + 1, exc))
+                await self._screenshot(page, "voucher_msg_%02d_open_fail" % (index + 1))
+                continue
+
+            received_at, received_at_dt = await self._header_received_at(header)
+            if since is not None and received_at_dt is not None and received_at_dt <= since:
+                self._log(
+                    "Skipping message %s at %s (not newer than %s)"
+                    % (index + 1, received_at_dt, since)
+                )
+                continue
+
+            try:
+                text, html = await self._scroll_iframe_until_voucher(page, iframe_loc)
+                redemption_id = self._redemption_id(text)
+                if redemption_id and redemption_id in seen_redemption_ids:
+                    self._log(
+                        "Message %s still shows Redemption ID %s; retrying scroll..."
+                        % (index + 1, redemption_id)
+                    )
+                    iframe_loc = await self._iframe_for_message(page, headers, index)
+                    text, html = await self._scroll_iframe_until_voucher(page, iframe_loc)
+                    redemption_id = self._redemption_id(text)
+
+                pairs = extract_all_voucher_url_and_code_pairs(text, html)
+                if not pairs:
+                    raise ValueError("No voucher url/code in message %s." % (index + 1))
+                order = extract_voucher_order_fields(text, html)
+            except (RuntimeError, ValueError) as exc:
+                await self._screenshot(page, "voucher_msg_%02d_missing" % (index + 1))
+                self._log("Message %s had no url/code: %s" % (index + 1, exc))
+                continue
+
+            await self._screenshot(page, "voucher_msg_%02d" % (index + 1))
+            added = False
+            for url, code in pairs:
+                pair = (url, code)
+                if pair in seen:
+                    self._log("Skipping duplicate pair in message %s" % (index + 1))
+                    continue
+                seen.add(pair)
+                if redemption_id:
+                    seen_redemption_ids.add(redemption_id)
+                added = True
+                details.append(
+                    LibraVoucherDetail(
+                        url=url,
+                        code=code,
+                        received_at=received_at,
+                        comanda_nr=order.get("comanda_nr", ""),
+                        redemption_id=order.get("redemption_id", "") or redemption_id,
+                        comanda_id=order.get("comanda_id", ""),
+                        cantitate=order.get("cantitate", ""),
+                        puncte=order.get("puncte", ""),
+                        subtotal=order.get("subtotal", ""),
+                        total=order.get("total", ""),
+                        received_at_dt=received_at_dt,
+                    )
+                )
+                self._log(
+                    "  extracted comanda#=%s redemption_id=%s code=%s"
+                    % (
+                        order.get("comanda_nr", "") or "?",
+                        order.get("redemption_id", "") or redemption_id or "?",
+                        code,
+                    )
+                )
+            if not added:
+                self._log("Message %s did not add new voucher pairs." % (index + 1))
+
+        if not details:
+            raise RuntimeError(
+                "No voucher url/code pairs found in thread %s." % subject
+            )
+        return details
+
+    async def _read_message_body_parts(self, page: Page) -> tuple[str, str]:
+        """Read message body text and HTML from the open message view."""
         await page.wait_for_selector(
             '[data-testid="message-view:body"], .message-content, article, iframe',
             timeout=60_000,
         )
 
-        texts: list[str] = []
-
+        best_text = ""
+        best_html = ""
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
             try:
-                frame_text = (await frame.locator("body").inner_text()).strip()
-                if frame_text:
-                    texts.append(frame_text)
+                frame_text, frame_html = await self._scroll_frame_body(page, frame)
+                if len(frame_text) > len(best_text):
+                    best_text = frame_text
+                    best_html = frame_html
             except Exception:
                 continue
 
-        for selector in (
-            '[data-testid="message-view:body"] iframe',
-            ".message-content iframe",
-            "article iframe",
-        ):
-            iframe = page.frame_locator(selector).first
-            try:
-                frame_text = (await iframe.locator("body").inner_text()).strip()
-                if frame_text:
-                    texts.append(frame_text)
-            except Exception:
-                continue
+        texts: list[str] = [best_text] if best_text else []
+        htmls: list[str] = [best_html] if best_html else []
 
         for selector in (
             '[data-testid="message-view:body"]',
@@ -515,15 +1121,41 @@ class ProtonEmailLogin:
                 target = body.first
                 await target.scroll_into_view_if_needed()
                 outer_text = (await target.inner_text()).strip()
-                if outer_text:
+                if outer_text and outer_text not in texts:
                     texts.append(outer_text)
 
-        combined = "\n".join(dict.fromkeys(texts))
-        if combined.strip():
-            self._log("Email body preview: %s..." % combined.strip()[:120])
-            return combined.strip()
+        text = "\n".join(dict.fromkeys(texts)).strip()
+        html = "\n".join(dict.fromkeys(htmls)).strip()
+        if text or html:
+            self._log("Email body preview: %s..." % (text[:120] or html[:120]))
+            return text, html
 
         raise RuntimeError("Could not read email body.")
+
+    async def _conversation_headers(self, page: Page) -> Locator:
+        """Return locators for message headers in the open conversation."""
+        for selector in (
+            '[data-testid="message-header"]',
+            '[data-shortcut-target="message-header"]',
+            ".message-header",
+        ):
+            headers = page.locator(selector)
+            if await headers.count() > 0:
+                return headers
+        raise RuntimeError("No conversation message headers found.")
+
+    async def _header_received_at(self, header: Locator) -> tuple[str, Optional[datetime]]:
+        time_locator = header.locator("time")
+        if await time_locator.count() == 0:
+            time_locator = header.locator("xpath=ancestor::*[1]//time")
+        if await time_locator.count() == 0:
+            return "", None
+
+        raw = (
+            await time_locator.first.get_attribute("datetime")
+            or await time_locator.first.inner_text()
+        ).strip()
+        return raw, parse_message_datetime(raw)
 
     async def _read_libra_one_time_code(self, page: Page) -> LibraOneTimeCode:
         row = await self._find_message_by_subject(page, self.LIBRA_ONE_TIME_CODE_SUBJECT)
