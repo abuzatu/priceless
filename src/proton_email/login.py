@@ -30,6 +30,38 @@ class ProtonEmailMessage:
     snippet: str
 
 
+@dataclass(frozen=True)
+class LibraOneTimeCode:
+    """One-time login code from a Libra X Priceless email."""
+
+    code: str
+    subject: str
+    received_at: str
+
+
+def extract_one_time_code(body: str) -> str:
+    """Parse a numeric one-time code from Libra email body text."""
+    patterns = (
+        re.compile(
+            r"Your one-time code for Libra X Priceless is:\s*([0-9]{4,8})",
+            re.I,
+        ),
+        re.compile(r"one[- ]time code[^0-9]*([0-9]{4,8})", re.I),
+        re.compile(r"verification code[^0-9]*([0-9]{4,8})", re.I),
+        re.compile(r"your code[^0-9]*([0-9]{4,8})", re.I),
+        re.compile(r"\b(\d{6})\b"),
+    )
+    normalized = re.sub(r"\s+", " ", body).strip()
+    for pattern in patterns:
+        match = pattern.search(normalized)
+        if match:
+            return match.group(1)
+    raise ValueError(
+        "Could not find a one-time code in the email body. Body preview: %s"
+        % (normalized[:200] or "<empty>")
+    )
+
+
 class ProtonEmailLogin:
     """Browser-based Proton Mail client (no IMAP/API; E2E encryption)."""
 
@@ -37,6 +69,9 @@ class ProtonEmailLogin:
     INBOX_URL = "https://mail.proton.me/u/0/inbox"
     LOGGED_IN_URL = re.compile(
         r"(mail\.proton\.me|account\.proton\.me/(apps|mail|u/))"
+    )
+    LIBRA_ONE_TIME_CODE_SUBJECT = re.compile(
+        r"One-time code for Libra X Priceless", re.I
     )
 
     def __init__(
@@ -48,6 +83,7 @@ class ProtonEmailLogin:
         verbose: bool = True,
         debug: bool = False,
         screenshot_dir: Optional[str] = None,
+        debug_version: str = "v01",
         slow_mo: int = 0,
     ) -> None:
         """Load credentials from `.env` and prepare browser settings.
@@ -59,6 +95,7 @@ class ProtonEmailLogin:
                 so you can follow progress from the notebook (like Selenium screenshots).
             screenshot_dir: Folder for step screenshots (default when debug=True:
                 data/debug/proton_email).
+            debug_version: Prefix for screenshot files, e.g. v01 -> v01_01_login_page.png.
             slow_mo: Milliseconds to pause between Playwright actions.
         """
         load_dotenv()
@@ -68,6 +105,7 @@ class ProtonEmailLogin:
         self.headless = headless
         self.verbose = verbose
         self.debug = debug
+        self.debug_version = debug_version
         self.slow_mo = 300 if debug and slow_mo == 0 else slow_mo
         workdir = Path(os.getenv("WORKDIR", Path.cwd()))
         self.screenshot_dir = (
@@ -91,6 +129,52 @@ class ProtonEmailLogin:
 
     async def login(self) -> ProtonEmailMessage:
         """Sign in to Proton Mail and return the most recent inbox message."""
+        try:
+            await self._connect_to_inbox()
+            self._log("Reading most recent email...")
+            message = await self._read_last_email(self._page)
+            await self._screenshot(self._page, "last_email_open")
+            return message
+        except Exception as exc:
+            await self._handle_error(exc)
+            raise
+
+    async def get_libra_one_time_code(self) -> LibraOneTimeCode:
+        """Open the latest Libra one-time-code email and return the code."""
+        try:
+            await self._connect_to_inbox()
+            self._log('Looking for "One-time code for Libra X Priceless"...')
+            result = await self._read_libra_one_time_code(self._page)
+            await self._screenshot(self._page, "libra_one_time_code")
+            self._log("Found code: %s" % result.code)
+            return result
+        except Exception as exc:
+            await self._handle_error(exc)
+            raise
+
+    def login_sync(self) -> ProtonEmailMessage:
+        """Blocking login for scripts outside an asyncio event loop (e.g. CLI)."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.login())
+        raise RuntimeError(
+            "Use `await client.login()` in Jupyter/async contexts, "
+            "or `client.login_sync()` only from a plain script."
+        )
+
+    def get_libra_one_time_code_sync(self) -> LibraOneTimeCode:
+        """Blocking version of `get_libra_one_time_code`."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.get_libra_one_time_code())
+        raise RuntimeError(
+            "Use `await client.get_libra_one_time_code()` in Jupyter/async contexts."
+        )
+
+    async def _connect_to_inbox(self) -> None:
+        """Launch browser, sign in, and open the inbox."""
         self._log(
             "Launching browser (headless=%s, debug=%s)..." % (self.headless, self.debug)
         )
@@ -119,39 +203,22 @@ class ProtonEmailLogin:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
-        try:
-            self._log("Signing in to Proton...")
-            await self._authenticate(self._page)
-            await self._screenshot(self._page, "authenticated")
-            self._log("Authenticated at %s" % self._page.url)
+        self._log("Signing in to Proton...")
+        await self._authenticate(self._page)
+        await self._screenshot(self._page, "authenticated")
+        self._log("Authenticated at %s" % self._page.url)
 
-            self._log("Opening inbox...")
-            await self._open_inbox(self._page)
-            await self._screenshot(self._page, "inbox")
+        self._log("Opening inbox...")
+        await self._open_inbox(self._page)
+        await self._screenshot(self._page, "inbox")
 
-            self._log("Reading most recent email...")
-            message = await self._read_last_email(self._page)
-            await self._screenshot(self._page, "last_email_open")
-            return message
-        except Exception as exc:
-            if self._page is not None:
-                path = await self._screenshot(self._page, "error")
-                if path is not None:
-                    raise RuntimeError("%s (screenshot: %s)" % (exc, path)) from exc
-            if not self.debug:
-                await self.close()
-            raise
-
-    def login_sync(self) -> ProtonEmailMessage:
-        """Blocking login for scripts outside an asyncio event loop (e.g. CLI)."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self.login())
-        raise RuntimeError(
-            "Use `await client.login()` in Jupyter/async contexts, "
-            "or `client.login_sync()` only from a plain script."
-        )
+    async def _handle_error(self, exc: Exception) -> None:
+        if self._page is not None:
+            path = await self._screenshot(self._page, "error")
+            if path is not None:
+                raise RuntimeError("%s (screenshot: %s)" % (exc, path)) from exc
+        if not self.debug:
+            await self.close()
 
     async def close(self) -> None:
         """Shut down the browser session."""
@@ -174,7 +241,9 @@ class ProtonEmailLogin:
         if self.screenshot_dir is None:
             return None
         self._screenshot_step += 1
-        path = self.screenshot_dir / ("%02d_%s.png" % (self._screenshot_step, label))
+        path = self.screenshot_dir / (
+            "%s_%02d_%s.png" % (self.debug_version, self._screenshot_step, label)
+        )
         await page.screenshot(path=str(path), full_page=True)
         self._log("Screenshot: %s" % path)
         return path
@@ -357,6 +426,120 @@ class ProtonEmailLogin:
             "No visible email rows found. Inbox may be empty or the UI changed."
         )
 
+    async def _find_message_by_subject(self, page: Page, pattern: re.Pattern[str]) -> Locator:
+        """Return the first (most recent) inbox row whose subject matches."""
+        await self._wait_for_message_list(page)
+        rows = page.locator(".item-container:not(.item-is-loading)")
+        count = await rows.count()
+        self._log("Scanning %s inbox rows for subject match..." % count)
+
+        for index in range(count):
+            row = rows.nth(index)
+            subject_el = row.locator(
+                '[data-testid="message-column:subject"], .item-subject [role="heading"]'
+            ).first
+            candidates: list[str] = []
+            if await subject_el.count() > 0:
+                title = await subject_el.get_attribute("title")
+                if title:
+                    candidates.append(title)
+                candidates.append(await subject_el.inner_text())
+            candidates.append(await row.inner_text())
+
+            for text in candidates:
+                if pattern.search(text):
+                    self._log("Matched email: %s" % text.strip().split("\n")[0])
+                    return row
+
+        raise RuntimeError('No email found with subject matching "%s".' % pattern.pattern)
+
+    async def _row_subject(self, row: Locator) -> str:
+        subject_el = row.locator(
+            '[data-testid="message-column:subject"], .item-subject [role="heading"]'
+        ).first
+        if await subject_el.count() > 0:
+            return (
+                await subject_el.get_attribute("title")
+                or await subject_el.inner_text()
+            ).strip()
+        return (await row.inner_text()).strip().split("\n")[0]
+
+    async def _row_received_at(self, row: Locator) -> str:
+        time_locator = row.locator("time")
+        if await time_locator.count() > 0:
+            return (
+                await time_locator.first.get_attribute("datetime")
+                or await time_locator.first.inner_text()
+            ).strip()
+        return ""
+
+    async def _read_message_body(self, page: Page) -> str:
+        """Read the full visible body of the currently open message."""
+        await page.wait_for_selector(
+            '[data-testid="message-view:body"], .message-content, article, iframe',
+            timeout=60_000,
+        )
+
+        texts: list[str] = []
+
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                frame_text = (await frame.locator("body").inner_text()).strip()
+                if frame_text:
+                    texts.append(frame_text)
+            except Exception:
+                continue
+
+        for selector in (
+            '[data-testid="message-view:body"] iframe',
+            ".message-content iframe",
+            "article iframe",
+        ):
+            iframe = page.frame_locator(selector).first
+            try:
+                frame_text = (await iframe.locator("body").inner_text()).strip()
+                if frame_text:
+                    texts.append(frame_text)
+            except Exception:
+                continue
+
+        for selector in (
+            '[data-testid="message-view:body"]',
+            ".message-content",
+            "article",
+        ):
+            body = page.locator(selector)
+            if await body.count() > 0:
+                target = body.first
+                await target.scroll_into_view_if_needed()
+                outer_text = (await target.inner_text()).strip()
+                if outer_text:
+                    texts.append(outer_text)
+
+        combined = "\n".join(dict.fromkeys(texts))
+        if combined.strip():
+            self._log("Email body preview: %s..." % combined.strip()[:120])
+            return combined.strip()
+
+        raise RuntimeError("Could not read email body.")
+
+    async def _read_libra_one_time_code(self, page: Page) -> LibraOneTimeCode:
+        row = await self._find_message_by_subject(page, self.LIBRA_ONE_TIME_CODE_SUBJECT)
+        subject = await self._row_subject(row)
+        received_at = await self._row_received_at(row)
+
+        await row.click()
+        body = await self._read_message_body(page)
+        code = extract_one_time_code(body)
+
+        return LibraOneTimeCode(
+            code=code,
+            subject=subject,
+            received_at=received_at,
+        )
+
     async def _read_last_email(self, page: Page) -> ProtonEmailMessage:
         await self._wait_for_message_list(page)
         await self._screenshot(page, "message_list")
@@ -394,21 +577,7 @@ class ProtonEmailLogin:
             )
 
         await subject_locator.click()
-        await page.wait_for_selector(
-            '[data-testid="message-view:body"], .message-content, article',
-            timeout=60_000,
-        )
-
-        snippet = ""
-        for selector in (
-            '[data-testid="message-view:body"]',
-            ".message-content",
-            "article",
-        ):
-            body = page.locator(selector)
-            if await body.count() > 0:
-                snippet = (await body.first.inner_text()).strip()
-                break
+        snippet = await self._read_message_body(page)
 
         return ProtonEmailMessage(
             sender=sender.strip(),
