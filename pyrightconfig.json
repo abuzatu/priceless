@@ -1,0 +1,25 @@
+{
+  "exclude": [
+    "**/data/**",
+    "**/datasets/**",
+    "**/__pycache__/**",
+    "**/venv/**",
+    "**/.venv/**",
+    "**/node_modules/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/cache/**",
+    "**/logs/**",
+    "**/temp/**",
+    "**/*.csv",
+    "**/*.json",
+    "**/*.parquet",
+    "**/*.db",
+    "**/*.sqlite"
+  ],
+  "ignore": [
+    "**/logs/**",
+    "**/cache/**"
+  ],
+  "stubPath": ""
+}
